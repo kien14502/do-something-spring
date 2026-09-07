@@ -1,0 +1,177 @@
+name: CD
+
+# Chỉ deploy từ branch main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Không chạy song song hai lần deploy lên cùng một server.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & push image
+    # workflow_dispatch có thể gọi từ branch khác; chặn lại ở đây.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Tên image phải viết thường; owner trên GitHub có thể có chữ hoa.
+      - name: Resolve image name
+        id: image
+        run: |
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${REGISTRY}/${repo}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REGISTRY}/${repo}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Dockerfile tự build jar (multi-stage), bỏ qua test.
+      # Test slice của HealthController chạy được, nhưng `./mvnw verify` vẫn fail
+      # ở DoSomethingApplicationTests.contextLoads (cần DataSource). Khi sửa xong,
+      # tách một workflow CI chạy `./mvnw verify` và cho job này `needs:` CI đó.
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: development/Dockerfile
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Mọi secret/vars bên dưới đọc từ environment 'production' trước, mới đến
+    # cấp repository/organization. Đặt SSH_* trong environment này để chỉ job
+    # deploy đọc được, và để dùng protection rule (reviewer, branch, wait timer).
+    environment:
+      name: production
+    env:
+      APP_IMAGE: ${{ needs.build.outputs.image }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/do-something' }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ vars.SSH_PORT || '22' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check production secrets
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -eu
+          missing=""
+          [ -n "$SSH_HOST" ] || missing="$missing SSH_HOST"
+          [ -n "$SSH_USER" ] || missing="$missing SSH_USER"
+          [ -n "$SSH_PRIVATE_KEY" ] || missing="$missing SSH_PRIVATE_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Environment 'production' thiếu secret:$missing"
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            # Không pin được host key: chấp nhận key server trả về lần đầu.
+            echo "::warning::SSH_KNOWN_HOSTS chưa được đặt, dùng ssh-keyscan (không chống được MITM)."
+            ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "Không lấy được host key của $SSH_HOST"; exit 1; }
+
+      # Chỉ gửi thư mục development/ (compose + scripts); .env.prod trên server
+      # không nằm trong gói nên không bị ghi đè.
+      - name: Upload compose bundle
+        run: |
+          set -eu
+          tar -czf compose-bundle.tar.gz development
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
+            compose-bundle.tar.gz "$SSH_USER@$SSH_HOST:/tmp/do-something-compose.tar.gz"
+
+      # Token đi qua stdin nên không lộ trong danh sách tiến trình của server.
+      - name: Log in to GHCR on server
+        run: |
+          set -eu
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" \
+            "$SSH_USER@$SSH_HOST" \
+            "docker login ${REGISTRY} -u '${{ github.actor }}' --password-stdin"
+
+      - name: Deploy
+        run: |
+          set -eu
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "env APP_IMAGE='$APP_IMAGE' DEPLOY_PATH='$DEPLOY_PATH' sh -s" <<'REMOTE'
+          set -eu
+          export APP_IMAGE
+
+          mkdir -p "$DEPLOY_PATH"
+          tar -xzf /tmp/do-something-compose.tar.gz -C "$DEPLOY_PATH"
+          rm -f /tmp/do-something-compose.tar.gz
+
+          if [ ! -f "$DEPLOY_PATH/development/.env.prod" ]; then
+            echo "Thiếu $DEPLOY_PATH/development/.env.prod. Tạo từ .env.prod.example và điền mật khẩu." >&2
+            exit 1
+          fi
+
+          COMPOSE="sh $DEPLOY_PATH/development/scripts/run-docker-product.sh"
+          $COMPOSE pull
+          $COMPOSE up -d --wait --wait-timeout 300
+          $COMPOSE ps
+          docker image prune -f
+          REMOTE
+
+      - name: Show app logs on failure
+        if: failure()
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "sh '$DEPLOY_PATH/development/scripts/run-docker-product.sh' logs --tail 200 app" || true
+
+      # GITHUB_TOKEN hết hạn khi job kết thúc; không để lại credential chết trên server.
+      - name: Log out of GHCR on server
+        if: always()
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "docker logout ${REGISTRY}" || true
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

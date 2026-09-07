@@ -1,0 +1,8 @@
+.git
+.github
+.idea
+target
+development/.env*
+!development/.env*.example
+*.iml
+HELP.md
