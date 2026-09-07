@@ -31,3 +31,7 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Local infrastructure credentials
+development/.env*
+!development/.env*.example

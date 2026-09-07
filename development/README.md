@@ -154,6 +154,7 @@ không. Thiếu secret sẽ fail ngay ở bước `Check production secrets`.
 | `SSH_HOST` | có | Host/IP của server prod |
 | `SSH_USER` | có | User SSH, phải nằm trong group `docker` |
 | `SSH_PRIVATE_KEY` | có | Private key deploy (không đặt passphrase) |
+| `ENV_FILE` | có | Toàn bộ nội dung `.env.prod`, xem `.env.prod.example` |
 | `SSH_KNOWN_HOSTS` | nên có | Host key đã pin; thiếu thì workflow dùng `ssh-keyscan` |
 
 Environment variables tuỳ chọn (`vars`, cũng đặt trong environment
@@ -165,18 +166,41 @@ trùng tên ở cấp repository sẽ bị environment ghi đè. Environment cò
 protection rule: yêu cầu reviewer duyệt, giới hạn branch `main`, hoặc wait timer
 trước khi deploy chạy.
 
-Chuẩn bị trên server trước lần deploy đầu:
+Nội dung `.env.prod` nằm trong secret `ENV_FILE`, không tạo tay trên server.
+Soạn file ở máy local rồi nạp:
 
 ```sh
-sudo mkdir -p /opt/do-something/development
-sudo chown "$USER" /opt/do-something -R
-# Chép .env.prod.example, điền mật khẩu, rồi:
-chmod 600 /opt/do-something/development/.env.prod
+cp development/.env.prod.example /tmp/.env.prod
+# Điền POSTGRES_PASSWORD, REDIS_PASSWORD. Dùng openssl rand -hex 24 cho an toàn:
+# file .env của Compose không hiểu quoting, mật khẩu có $ # ' " sẽ bị parse sai.
+gh secret set ENV_FILE --env production < /tmp/.env.prod
+shred -u /tmp/.env.prod
 ```
 
-Workflow chỉ giải nén `development/` vào `DEPLOY_PATH`; `.env.prod` trên server
-không nằm trong gói nên không bị ghi đè. Rollback bằng cách chạy lại script với
-`APP_IMAGE` trỏ về tag `<sha>` cũ.
+Mỗi lần deploy, workflow ghi `ENV_FILE` vào
+`$DEPLOY_PATH/development/.env.prod` (mode 600, truyền qua stdin của `ssh` nên
+không lộ trong `ps`), chạy compose, rồi **xoá file đó ở bước cleanup**. Bước
+cleanup có `if: always()` nên fail giữa chừng cũng không để lại secret trên đĩa.
+
+Hệ quả: sau khi deploy xong, server không còn `.env.prod`, nên
+`run-docker-product.sh` chạy tay sẽ dừng với thông báo thiếu file. Container
+đang chạy không ảnh hưởng — Docker đã lưu biến môi trường vào container, kể cả
+khi restart. Để xem trạng thái thủ công, dùng lệnh `docker` thay cho
+`docker compose`:
+
+```sh
+docker ps --filter label=com.docker.compose.project=do-something-prod
+docker logs -f do-something-prod-app-1
+```
+
+Cần chạy lệnh compose thật (down, restart, đổi tag) thì tạo lại `.env.prod`
+tạm thời với đúng nội dung của secret rồi xoá đi, hoặc re-run workflow.
+
+Rollback: re-run workflow ở commit cũ, hoặc tạo lại `.env.prod` rồi chạy script
+với `APP_IMAGE` trỏ về tag `<sha>` cũ.
+
+Chuẩn bị server trước lần deploy đầu chỉ cần cài Docker Engine + Compose v2 và
+đảm bảo `SSH_USER` ghi được vào `DEPLOY_PATH` (workflow tự `mkdir -p`).
 
 Workflow `docker logout ghcr.io` sau khi deploy vì `GITHUB_TOKEN` hết hạn cùng
 job. Muốn `pull` thủ công trên server thì tự đăng nhập bằng personal access token

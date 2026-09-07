@@ -88,12 +88,14 @@ jobs:
       - name: Check production secrets
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          ENV_FILE: ${{ secrets.ENV_FILE }}
         run: |
           set -eu
           missing=""
           [ -n "$SSH_HOST" ] || missing="$missing SSH_HOST"
           [ -n "$SSH_USER" ] || missing="$missing SSH_USER"
           [ -n "$SSH_PRIVATE_KEY" ] || missing="$missing SSH_PRIVATE_KEY"
+          [ -n "$ENV_FILE" ] || missing="$missing ENV_FILE"
           if [ -n "$missing" ]; then
             echo "::error::Environment 'production' thiếu secret:$missing"
             exit 1
@@ -127,6 +129,23 @@ jobs:
           scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
             compose-bundle.tar.gz "$SSH_USER@$SSH_HOST:/tmp/do-something-compose.tar.gz"
 
+      # Nội dung .env.prod nằm trong secret ENV_FILE, ghi thẳng qua stdin và bị
+      # xoá ở bước cleanup nên chỉ tồn tại trên đĩa server trong lúc deploy.
+      - name: Write production env file
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: |
+          set -eu
+          for key in POSTGRES_PASSWORD REDIS_PASSWORD; do
+            printf '%s\n' "$ENV_FILE" | grep -qE "^${key}=.+" \
+              || { echo "::error::Secret ENV_FILE thiếu hoặc để trống $key"; exit 1; }
+          done
+          printf '%s\n' "$ENV_FILE" | tr -d '\r' | ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" \
+            "$SSH_USER@$SSH_HOST" \
+            "mkdir -p '$DEPLOY_PATH/development' \
+               && umask 077 && cat > '$DEPLOY_PATH/development/.env.prod' \
+               && chmod 600 '$DEPLOY_PATH/development/.env.prod'"
+
       # Token đi qua stdin nên không lộ trong danh sách tiến trình của server.
       - name: Log in to GHCR on server
         run: |
@@ -148,7 +167,7 @@ jobs:
           rm -f /tmp/do-something-compose.tar.gz
 
           if [ ! -f "$DEPLOY_PATH/development/.env.prod" ]; then
-            echo "Thiếu $DEPLOY_PATH/development/.env.prod. Tạo từ .env.prod.example và điền mật khẩu." >&2
+            echo "Thiếu $DEPLOY_PATH/development/.env.prod (bước Write production env file đã chạy chưa?)." >&2
             exit 1
           fi
 
@@ -164,6 +183,13 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
             "sh '$DEPLOY_PATH/development/scripts/run-docker-product.sh' logs --tail 200 app" || true
+
+      # Chạy sau bước lấy log vì run-docker-product.sh cần .env.prod mới chạy được.
+      - name: Remove production env file
+        if: always()
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "rm -f '$DEPLOY_PATH/development/.env.prod'" || true
 
       # GITHUB_TOKEN hết hạn khi job kết thúc; không để lại credential chết trên server.
       - name: Log out of GHCR on server
